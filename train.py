@@ -24,6 +24,8 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene.gaussian_model import build_scaling_rotation
+
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -93,7 +95,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
         image = render_pkg["render"]
-
+        viewspace_point_tensor = render_pkg["viewspace_points"]
+        visibility_filter = render_pkg["visibility_filter"]
+        radii = render_pkg["radii"]
+        
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
@@ -126,8 +131,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.relocate_gs(dead_mask=dead_mask)
                 gaussians.add_new_gs(cap_max=args.cap_max)
 
+            # turn high graident gaussians to black
+            if iteration > opt.black_iter:
+                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                   gaussians.turn_gaussians_black(grad_threshold=opt.black_gradient_threshold) 
+
             # Optimizer step
-            if iteration < opt.iterations:
+            if iteration < opt.iterations and iteration <= opt.black_iter:
+                # gaussians.zero_frozen_grads() #dont train the frozen ones
+                
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
 

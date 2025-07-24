@@ -57,6 +57,7 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self.frozen_mask = torch.empty(0, dtype=torch.bool)
         self.setup_functions()
 
     def capture(self):
@@ -73,6 +74,7 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self.frozen_mask
         )
     
     def restore(self, model_args, training_args):
@@ -87,7 +89,8 @@ class GaussianModel:
         xyz_gradient_accum, 
         denom,
         opt_dict, 
-        self.spatial_lr_scale) = model_args
+        self.spatial_lr_scale,
+        self.frozen_mask) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -146,6 +149,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.frozen_mask = torch.zeros((self.get_xyz.shape[0]), dtype=torch.bool, device="cuda")
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -304,6 +308,7 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        self.frozen_mask = self.frozen_mask[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -342,6 +347,8 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        
+        self.frozen_mask = torch.cat((self.frozen_mask, torch.zeros(new_xyz.shape[0], dtype=torch.bool, device="cuda")), dim=0)
 
         if reset_params:
             self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -403,7 +410,38 @@ class GaussianModel:
         self.prune_points(prune_mask)
 
         torch.cuda.empty_cache()
+        
+    def turn_gaussians_black(self, grad_threshold):
+        grads = self.xyz_gradient_accum / self.denom
+        grads[grads.isnan()] = 0.0 
+        
+        mask = torch.norm(grads, dim=-1) >= grad_threshold
+        
+        if mask.sum() == 0:
+            return
+        self.frozen_mask = torch.logical_or(self.frozen_mask, mask)
+        self._opacity[mask] = self.inverse_opacity_activation(torch.ones_like(self._opacity[mask]) * 0.999)
+        self._features_dc[mask] = 0.0
+        self._features_rest[mask] = 0.0
 
+        torch.cuda.empty_cache()
+        
+    def zero_frozen_grads(self):
+        if self.frozen_mask.sum() == 0:
+            return
+        if self._xyz.grad is not None:
+            self._xyz.grad[self.frozen_mask] = 0.0
+        if self._opacity.grad is not None:
+            self._opacity.grad[self.frozen_mask] = 0.0
+        if self._features_dc.grad is not None:
+            self._features_dc.grad[self.frozen_mask] = 0.0
+        if self._features_rest.grad is not None:
+            self._features_rest.grad[self.frozen_mask] = 0.0
+        if self._scaling.grad is not None:
+            self._scaling.grad[self.frozen_mask] = 0.0
+        if self._rotation.grad is not None:
+            self._rotation.grad[self.frozen_mask] = 0.0
+        
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
